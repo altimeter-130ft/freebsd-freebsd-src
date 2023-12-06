@@ -134,6 +134,8 @@ static SYSCTL_NODE(_vfs_vnode, OID_AUTO, stats, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "vnode statistics");
 static SYSCTL_NODE(_vfs_vnode, OID_AUTO, vnlru, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "vnode recycling");
+static SYSCTL_NODE(_vfs_vnode, OID_AUTO, free, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "vnode free");
 
 /*
  * Number of vnodes in existence.  Increased whenever getnewvnode()
@@ -226,6 +228,171 @@ SYSCTL_COUNTER_U64(_vfs_vnode_stats, OID_AUTO, skipped_requeues, CTLFLAG_RD, &vn
 static u_long deferred_inact;
 SYSCTL_ULONG(_vfs, OID_AUTO, deferred_inact, CTLFLAG_RD,
     &deferred_inact, 0, "Number of times inactive processing was deferred");
+
+static counter_u64_t free_request_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_request, CTLFLAG_RD,
+    &free_request_count,
+    "Number of vnode free, requests");
+
+static counter_u64_t free_request_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_request_zfs, CTLFLAG_RD,
+    &free_request_zfs_count,
+    "Number of vnode free, requests by zfs");
+
+static counter_u64_t free_freed_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_freed, CTLFLAG_RD,
+    &free_freed_count,
+    "Number of vnode free, freed");
+
+static counter_u64_t free_freed_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_freed_zfs, CTLFLAG_RD,
+    &free_freed_zfs_count,
+    "Number of vnode free, freed by zfs");
+
+static counter_u64_t free_call_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_call, CTLFLAG_RD,
+    &free_call_count,
+    "Number of vnode free, calls");
+
+static counter_u64_t free_call_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_call_zfs, CTLFLAG_RD,
+    &free_call_zfs_count,
+    "Number of vnode free, calls by zfs");
+
+static counter_u64_t free_attempt_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_attempt, CTLFLAG_RD,
+    &free_attempt_count,
+    "Number of vnode free, attempts");
+
+static counter_u64_t free_attempt_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_attempt_zfs, CTLFLAG_RD,
+    &free_attempt_zfs_count,
+    "Number of vnode free, attempts by zfs");
+
+static counter_u64_t free_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_retry, CTLFLAG_RD,
+    &free_retry_count,
+    "Number of vnode free, retries");
+
+static counter_u64_t free_retry_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_retry_zfs, CTLFLAG_RD,
+    &free_retry_zfs_count,
+    "Number of vnode free, retries by zfs");
+
+static counter_u64_t free_giveup_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_giveup, CTLFLAG_RD,
+    &free_giveup_count,
+    "Number of vnode free, give ups");
+
+static counter_u64_t free_giveup_zfs_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_giveup_zfs, CTLFLAG_RD,
+    &free_giveup_zfs_count,
+    "Number of vnode free, give ups by zfs");
+
+static counter_u64_t free_phase1_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase1_retry, CTLFLAG_RD,
+    &free_phase1_retry_count,
+    "Number of vnode free, phase 1 retry (skip marker)");
+
+static counter_u64_t free_phase2_retry_reg_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg, CTLFLAG_RD,
+    &free_phase2_retry_reg_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files");
+
+static counter_u64_t free_phase2_retry_dir_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir, CTLFLAG_RD,
+    &free_phase2_retry_dir_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories");
+
+static counter_u64_t free_phase2_retry_reg_cleanbuf_only_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_cleanbuf_only, CTLFLAG_RD,
+    &free_phase2_retry_reg_cleanbuf_only_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by clean bufs only");
+
+static counter_u64_t free_phase2_retry_reg_cleanbuf_vmpage_only_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_cleanbuf_vmpage_only, CTLFLAG_RD,
+    &free_phase2_retry_reg_cleanbuf_vmpage_only_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by clean bufs and VM pages only");
+
+static counter_u64_t free_phase2_retry_reg_buf_vmpage_only_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_buf_vmpage_only, CTLFLAG_RD,
+    &free_phase2_retry_reg_buf_vmpage_only_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by bufs and VM pages only");
+
+static counter_u64_t free_phase2_retry_reg_inuse_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_inuse, CTLFLAG_RD,
+    &free_phase2_retry_reg_inuse_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, in use");
+
+static counter_u64_t free_phase2_retry_reg_unknown_1_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_unknown_1, CTLFLAG_RD,
+    &free_phase2_retry_reg_unknown_1_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by 1 unknown source");
+
+static counter_u64_t free_phase2_retry_reg_unknown_2_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_unknown_2, CTLFLAG_RD,
+    &free_phase2_retry_reg_unknown_2_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by 2 unknown sources");
+
+static counter_u64_t free_phase2_retry_reg_unknown_3more_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_reg_unknown_3more, CTLFLAG_RD,
+    &free_phase2_retry_reg_unknown_3more_count,
+    "Number of vnode free, phase 2 retry (vnode held), regular files, held by 3 or more unknown sources");
+
+static counter_u64_t free_phase2_retry_dir_nc_src_only_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir_nc_src_only, CTLFLAG_RD,
+    &free_phase2_retry_dir_nc_src_only_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories, held by namecache source only");
+
+static counter_u64_t free_phase2_retry_dir_inuse_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir_inuse, CTLFLAG_RD,
+    &free_phase2_retry_dir_inuse_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories, in use");
+
+static counter_u64_t free_phase2_retry_dir_unknown_1_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir_unknown_1, CTLFLAG_RD,
+    &free_phase2_retry_dir_unknown_1_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories, held by 1 unknown source");
+
+static counter_u64_t free_phase2_retry_dir_unknown_2_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir_unknown_2, CTLFLAG_RD,
+    &free_phase2_retry_dir_unknown_2_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories, held by 2 unknown sources");
+
+static counter_u64_t free_phase2_retry_dir_unknown_3more_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry_dir_unknown_3more, CTLFLAG_RD,
+    &free_phase2_retry_dir_unknown_3more_count,
+    "Number of vnode free, phase 2 retry (vnode held), directories, held by 3 or more unknown sources");
+
+static counter_u64_t free_phase2_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase2_retry, CTLFLAG_RD,
+    &free_phase2_retry_count,
+    "Number of vnode free, phase 2 retry (vnode held)");
+
+static counter_u64_t free_phase3_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase3_retry, CTLFLAG_RD,
+    &free_phase3_retry_count,
+    "Number of vnode free, phase 3 retry (crossing mountpoint)");
+
+static counter_u64_t free_phase4_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase4_retry, CTLFLAG_RD,
+    &free_phase4_retry_count,
+    "Number of vnode free, phase 4 retry (lost free race)");
+
+static counter_u64_t free_phase5_retry_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_phase5_retry, CTLFLAG_RD,
+    &free_phase5_retry_count,
+    "Number of vnode free, phase 5 retry (vnode hold miss)");
+
+static counter_u64_t free_success_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_success, CTLFLAG_RD,
+    &free_success_count,
+    "Number of vnode free, success");
+
+static counter_u64_t free_failed_count;
+SYSCTL_COUNTER_U64(_vfs_vnode_free, OID_AUTO, free_failed, CTLFLAG_RD,
+    &free_failed_count,
+    "Number of vnode free, success");
 
 /* To keep more than one thread at a time from running vfs_getnewfsid */
 static struct mtx mntid_mtx;
@@ -777,6 +944,39 @@ vntblinit(void *dummy __unused)
 	vnodes_created = counter_u64_alloc(M_WAITOK);
 	direct_recycles_free_count = counter_u64_alloc(M_WAITOK);
 	vnode_skipped_requeues = counter_u64_alloc(M_WAITOK);
+	free_request_count = counter_u64_alloc(M_WAITOK);
+	free_request_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_freed_count = counter_u64_alloc(M_WAITOK);
+	free_freed_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_call_count = counter_u64_alloc(M_WAITOK);
+	free_call_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_attempt_count = counter_u64_alloc(M_WAITOK);
+	free_attempt_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_retry_count = counter_u64_alloc(M_WAITOK);
+	free_retry_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_giveup_count = counter_u64_alloc(M_WAITOK);
+	free_giveup_zfs_count = counter_u64_alloc(M_WAITOK);
+	free_phase1_retry_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_cleanbuf_only_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_cleanbuf_vmpage_only_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_buf_vmpage_only_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_inuse_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_unknown_1_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_unknown_2_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_reg_unknown_3more_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_nc_src_only_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_inuse_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_unknown_1_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_unknown_2_count = counter_u64_alloc(M_WAITOK);
+	free_phase2_retry_dir_unknown_3more_count = counter_u64_alloc(M_WAITOK);
+	free_phase3_retry_count = counter_u64_alloc(M_WAITOK);
+	free_phase4_retry_count = counter_u64_alloc(M_WAITOK);
+	free_phase5_retry_count = counter_u64_alloc(M_WAITOK);
+	free_success_count = counter_u64_alloc(M_WAITOK);
+	free_failed_count = counter_u64_alloc(M_WAITOK);
 
 	/*
 	 * Initialize the filesystem syncer.
@@ -1389,8 +1589,8 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 {
 	struct vnode *vp;
 	struct mount *mp;
-	int ocount, vn_holdcnt, cleanbuf_holdcnt, dirtybuf_holdcnt, vmpage_holdcnt,
-		nc_src_holdcnt, unknown_holdcnt;
+	int ocount, ret, vn_usecount, vn_holdcnt, cleanbuf_holdcnt,
+		dirtybuf_holdcnt, vmpage_holdcnt, nc_src_holdcnt, unknown_holdcnt;
 	bool retried, *phase2_go_toggle, phase2_go;
 
 	mtx_assert(&vnode_list_mtx, MA_OWNED);
@@ -1403,7 +1603,16 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 	ocount = count;
 	retried = false;
 	vp = mvp;
+	counter_u64_add(free_call_count, 1);
+	counter_u64_add(free_request_count, count);
+	if (mnt_op != NULL) {
+		counter_u64_add(free_call_zfs_count, 1);
+		counter_u64_add(free_request_zfs_count, count);
+	}
 	for (;;) {
+		counter_u64_add(free_attempt_count, 1);
+		if (mnt_op != NULL)
+			counter_u64_add(free_attempt_zfs_count, 1);
 		vp = TAILQ_NEXT(vp, v_vnodelist);
 		if (__predict_false(vp == NULL)) {
 			/*
@@ -1418,6 +1627,9 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 				TAILQ_INSERT_HEAD(&vnode_list, mvp, v_vnodelist);
 				vp = mvp;
 				retried = true;
+				counter_u64_add(free_retry_count, 1);
+				if (mnt_op != NULL)
+					counter_u64_add(free_retry_zfs_count, 1);
 				continue;
 			}
 
@@ -1427,10 +1639,15 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 			TAILQ_REMOVE(&vnode_list, mvp, v_vnodelist);
 			TAILQ_INSERT_TAIL(&vnode_list, mvp, v_vnodelist);
 			mtx_unlock(&vnode_list_mtx);
+			counter_u64_add(free_giveup_count, 1);
+			if (mnt_op != NULL)
+				counter_u64_add(free_giveup_zfs_count, 1);
 			break;
 		}
-		if (__predict_false(vp->v_type == VMARKER))
+		if (__predict_false(vp->v_type == VMARKER)) {
+			counter_u64_add(free_phase1_retry_count, 1);
 			continue;
+		}
 		/*
 		 * Don't recycle if our vnode is from different type
 		 * of mount point.  Note that mp is type-safe, the
@@ -1439,9 +1656,11 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 		 */
 		if (mnt_op != NULL && (mp = vp->v_mount) != NULL &&
 		    mp->mnt_op != mnt_op) {
+			counter_u64_add(free_phase3_retry_count, 1);
 			continue;
 		}
 		if (vp->v_type == VBAD || __predict_false(vp->v_type == VNON)) {
+			counter_u64_add(free_phase4_retry_count, 1);
 			continue;
 		}
 		vn_holdcnt = atomic_load_int(&vp->v_holdcnt);
@@ -1452,6 +1671,10 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 			switch (vp->v_type) {
 				case VREG:
 					phase2_go_toggle = &recycle_vnode_bufs_pages;
+
+					vn_usecount = atomic_load_int(&vp->v_usecount);
+					if (0 < vn_usecount)
+						counter_u64_add(free_phase2_retry_reg_inuse_count, 1);
 
 					/*
 					 * Count the holds by the bufs and VM pages in the object,
@@ -1467,20 +1690,40 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 					if ((cleanbuf_holdcnt == vn_holdcnt) &&
 						(0 == dirtybuf_holdcnt) && (0 == vmpage_holdcnt)) {
 						phase2_go = true;
+						counter_u64_add(free_phase2_retry_reg_cleanbuf_only_count, 1);
 					} else if (((cleanbuf_holdcnt + vmpage_holdcnt) == vn_holdcnt) &&
 						(0 == dirtybuf_holdcnt)) {
 						phase2_go = true;
+						counter_u64_add(free_phase2_retry_reg_cleanbuf_vmpage_only_count, 1);
+					} else if (((cleanbuf_holdcnt + dirtybuf_holdcnt + vmpage_holdcnt) ==
+						vn_holdcnt) &&
+						(0 < dirtybuf_holdcnt)) {
+						counter_u64_add(free_phase2_retry_reg_buf_vmpage_only_count, 1);
 					}
+
+					if (!phase2_go) {
+						counter_u64_add(free_phase2_retry_reg_count, 1);
+						if (1 == unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_reg_unknown_1_count, 1);
+						else if (2 == unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_reg_unknown_2_count, 1);
+						else if (3 <= unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_reg_unknown_3more_count, 1);
+					}
+
 					break;
 
 				case VDIR:
 					phase2_go_toggle = &recycle_vnode_nc_src;
 
+					vn_usecount = atomic_load_int(&vp->v_usecount);
+					if (0 < vn_usecount)
+						counter_u64_add(free_phase2_retry_dir_inuse_count, 1);
+
 					/*
 					 * Count the holds by the namecache entries from this
 					 * vnode, and compare them to the actual hold count.
 					 */
-
 					vnlru_count_hold_sources_dir(vp,
 						&vn_holdcnt,
 						&nc_src_holdcnt,
@@ -1488,24 +1731,41 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 
 					if (nc_src_holdcnt == vn_holdcnt) {
 						phase2_go = true;
+						counter_u64_add(free_phase2_retry_dir_nc_src_only_count, 1);
+					}
+
+					if (!phase2_go) {
+						counter_u64_add(free_phase2_retry_dir_count, 1);
+						if (1 == unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_dir_unknown_1_count, 1);
+						else if (2 == unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_dir_unknown_2_count, 1);
+						else if (3 <= unknown_holdcnt)
+							counter_u64_add(free_phase2_retry_dir_unknown_3more_count, 1);
 					}
 
 					break;
+
 				default:
 					/*
 					 * NOP; the rest of the vnode types should not happen so
 					 * often.
+					 * NB VNON and VBAD are filtered out in phase 4.
 					 */
 					break;
 			}
 
 			if ((NULL == phase2_go_toggle) ||
 				!(*phase2_go_toggle) ||
-				!phase2_go)
+				!phase2_go) {
+				counter_u64_add(free_phase2_retry_count, 1);
 				continue;
+			}
 		}
-		if (!vhold_recycle_free(vp))
+		if (!vhold_recycle_free(vp)) {
+			counter_u64_add(free_phase5_retry_count, 1);
 			continue;
+		}
 		TAILQ_REMOVE(&vnode_list, mvp, v_vnodelist);
 		TAILQ_INSERT_AFTER(&vnode_list, vp, mvp, v_vnodelist);
 		mtx_unlock(&vnode_list_mtx);
@@ -1530,7 +1790,13 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 		 *
 		 * Check nullfs for one example (null_getwritemount).
 		 */
-		vtryrecycle(vp, isvnlru);
+
+		ret = vtryrecycle(vp, isvnlru);
+		if (0 == ret) {
+			counter_u64_add(free_success_count, 1);
+		} else {
+			counter_u64_add(free_failed_count, 1);
+		}
 		count--;
 		if (count == 0) {
 			break;
@@ -1539,6 +1805,14 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp, bool isvnlr
 		vp = mvp;
 	}
 	mtx_assert(&vnode_list_mtx, MA_NOTOWNED);
+	/*
+	 * XXX
+	 * Actually the vnodes passed to vnlru_free_impl(), regardless of the
+	 * results.
+	 */
+	counter_u64_add(free_freed_count, ocount - count);
+	if (mnt_op != NULL)
+		counter_u64_add(free_freed_zfs_count, ocount - count);
 	return (ocount - count);
 }
 
