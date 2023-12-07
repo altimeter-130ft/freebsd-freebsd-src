@@ -253,6 +253,7 @@ struct mount {
 	int		mnt_secondary_accwrites;/* (i) secondary wr. starts */
 	struct thread	*mnt_susp_owner;	/* (i) thread owning suspension */
 	struct ucred	*mnt_exjail;		/* (i) jail which did exports */
+	uint64_t	*mnt_fsvninusep;	/* per-filesystem count of vnodes in use */
 #define	mnt_endzero	mnt_gjprovider
 	char		*mnt_gjprovider;	/* gjournal provider name */
 	struct mtx	mnt_listmtx;

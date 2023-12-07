@@ -66,6 +66,7 @@
 #include <sys/osd.h>
 #include <ufs/ufs/quota.h>
 #include <sys/zfs_quota.h>
+#include <sys/arc_impl.h>
 
 #include "zfs_comutil.h"
 
@@ -170,6 +171,27 @@ VFS_SET(zfs_vfsops, zfs, VFCF_DELEGADMIN | VFCF_JAIL);
  * from being unloaded after a umount -f
  */
 static uint32_t	zfs_active_fs_count = 0;
+
+/*
+ * The counts of the znodes and those in use. (vp->v_usecount > 0)
+ * They are used to estimate the number of the ARC-prunable [vz]nodes and
+ * dnodes.
+ */
+uint64_t zfs_znode_count;
+uint64_t zfs_znode_inuse_count;
+
+/*
+ * The stats of the ARC pruning.
+ *
+ * - zfs_znode_pruning_requested
+ *   The requests of the ARC pruning.
+ *
+ * - zfs_znode_pruning_skipped
+ *   The skipped ARC pruning attempts because the prunable znodes do not meet
+ *   the requested size.
+ */
+wmsum_t zfs_znode_pruning_requested;
+wmsum_t zfs_znode_pruning_skipped;
 
 int
 zfs_get_temporary_prop(dsl_dataset_t *ds, zfs_prop_t zfs_prop, uint64_t *val,
@@ -1212,6 +1234,9 @@ zfs_domount(vfs_t *vfsp, char *osname)
 #if defined(_KERNEL) && !defined(KMEM_DEBUG)
 	vfsp->mnt_kern_flag |= MNTK_FPLOOKUP;
 #endif
+
+	vfsp->mnt_fsvninusep = &zfs_znode_inuse_count;
+
 	/*
 	 * The fsid is 64 bits, composed of an 8-bit fs type, which
 	 * separates our fsid from any other filesystem types, and a
@@ -2081,13 +2106,41 @@ static struct vnode *zfs_vnlru_marker;
 static arc_prune_t *zfs_prune;
 
 static void
-zfs_prune_task(uint64_t nr_to_scan, void *arg __unused)
+zfs_prune_task(uint64_t dn_to_scan, void *arg __unused)
 {
-	if (nr_to_scan > INT_MAX)
-		nr_to_scan = INT_MAX;
+	int64_t zn_prunable, dn_total;
+	uint64_t zn_total, zn_inuse, zn_to_scan;
+
+	wmsum_add(&zfs_znode_pruning_requested, 1);
+
+	zn_total = atomic_load_acq_64(&zfs_znode_count);
+	zn_inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	zn_prunable = zn_total - zn_inuse;
+
+	/*
+	 * Scale the number of the prunable dnodes into the znodes by the total
+	 * number of the znodes and dnodes.  A znode may span across multiple
+	 * dnodes, but the precise span estimation is both complicated and opaque
+	 * to the znode and vnode sides.
+	 *
+	 * Assume that the numbers of the znodes and dnodes fit within the 32 bit
+	 * integer type.
+	 */
+	zn_to_scan = dn_to_scan * zn_total;
+	dn_total = wmsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
+	zn_to_scan /= dn_total;
+
+	if (zn_prunable < zn_to_scan) {
+		wmsum_add(&zfs_znode_pruning_skipped, 1);
+		return;
+	}
+
+	if (zn_to_scan > INT_MAX)
+		zn_to_scan = INT_MAX;
 #if __FreeBSD_version >= 1300139
 	sx_xlock(&zfs_vnlru_lock);
-	vnlru_free_vfsops(nr_to_scan, &zfs_vfsops, zfs_vnlru_marker);
+	vnlru_free_vfsops(zn_to_scan, &zfs_vfsops, zfs_vnlru_marker);
 	sx_xunlock(&zfs_vnlru_lock);
 #else
 	vnlru_free(nr_to_scan, &zfs_vfsops);
@@ -2117,6 +2170,9 @@ zfs_init(void)
 	 */
 	zfs_vnodes_adjust();
 
+	wmsum_init(&zfs_znode_pruning_requested, 0);
+	wmsum_init(&zfs_znode_pruning_skipped, 0);
+
 	dmu_objset_register_type(DMU_OST_ZFS, zpl_get_file_info);
 
 	zfsvfs_taskq = taskq_create("zfsvfs", 1, minclsyspri, 0, 0, 0);
@@ -2136,6 +2192,9 @@ zfs_fini(void)
 	vnlru_free_marker(zfs_vnlru_marker);
 	sx_destroy(&zfs_vnlru_lock);
 #endif
+
+	wmsum_fini(&zfs_znode_pruning_requested);
+	wmsum_fini(&zfs_znode_pruning_skipped);
 
 	taskq_destroy(zfsvfs_taskq);
 	zfsctl_fini();
