@@ -124,6 +124,7 @@ SYSCTL_NODE(_vfs_zfs, OID_AUTO, vnops, CTLFLAG_RW, 0, "ZFS VNOPS");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zevent, CTLFLAG_RW, 0, "ZFS event");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zil, CTLFLAG_RW, 0, "ZFS ZIL");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zio, CTLFLAG_RW, 0, "ZFS ZIO");
+SYSCTL_NODE(_vfs_zfs, OID_AUTO, znode, CTLFLAG_RW, 0, "ZFS znode");
 
 SYSCTL_NODE(_vfs_zfs_livelist, OID_AUTO, condense, CTLFLAG_RW, 0,
 	"ZFS livelist condense");
@@ -469,6 +470,35 @@ SYSCTL_PROC(_vfs_zfs, OID_AUTO, l2c_only_size,
 	CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
 	&ARC_l2c_only, 0, param_get_arc_state_size, "Q",
 	"size of l2c_only state");
+/* END CSTYLED */
+
+/* arc_os.c */
+
+extern counter_u64_t zfs_arc_vm_lowmem_events;
+extern counter_u64_t zfs_arc_vm_lowmem_kmem;
+extern counter_u64_t zfs_arc_vm_lowmem_pages;
+extern counter_u64_t zfs_arc_vm_lowmem_nofree;
+extern counter_u64_t zfs_arc_vm_lowmem_pagedaemon;
+
+SYSCTL_NODE(_vfs_zfs_arc, OID_AUTO, vm_lowmem, CTLFLAG_RW, 0,
+	"vm_lowmem kernel event received by ARC");
+
+/* BEGIN CSTYLED */
+SYSCTL_COUNTER_U64(_vfs_zfs_arc_vm_lowmem, OID_AUTO, events,
+	CTLFLAG_RD, &zfs_arc_vm_lowmem_events,
+	"total vm_lowmem events");
+SYSCTL_COUNTER_U64(_vfs_zfs_arc_vm_lowmem, OID_AUTO, kmem,
+	CTLFLAG_RD, &zfs_arc_vm_lowmem_kmem,
+	"low kernel memory events");
+SYSCTL_COUNTER_U64(_vfs_zfs_arc_vm_lowmem, OID_AUTO, pages,
+	CTLFLAG_RD, &zfs_arc_vm_lowmem_pages,
+	"low page events");
+SYSCTL_COUNTER_U64(_vfs_zfs_arc_vm_lowmem, OID_AUTO, nofree,
+	CTLFLAG_RD, &zfs_arc_vm_lowmem_nofree,
+	"ARC memory not freed");
+SYSCTL_COUNTER_U64(_vfs_zfs_arc_vm_lowmem, OID_AUTO, pagedaemon,
+	CTLFLAG_RD, &zfs_arc_vm_lowmem_pagedaemon,
+	"calls by pagedaemon");
 /* END CSTYLED */
 
 /* dbuf.c */
@@ -869,4 +899,44 @@ SYSCTL_UINT(_vfs_zfs, OID_AUTO, top_maxinflight,
 SYSCTL_INT(_vfs_zfs_zio, OID_AUTO, exclude_metadata,
 	CTLFLAG_RDTUN, &zio_exclude_metadata, 0,
 	"Exclude metadata buffers from dumps as well");
+/* END CSTYLED */
+
+/* zfs_vfsops.c */
+
+static int
+param_get_znode_prunable_count(SYSCTL_HANDLER_ARGS)
+{
+	int64_t val;
+	uint64_t count, inuse;
+
+	count = atomic_load_acq_64(&zfs_znode_count);
+	inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	val = count - inuse;
+	return (sysctl_handle_64(oidp, &val, 0, req));
+}
+
+/* BEGIN CSTYLED */
+SYSCTL_UQUAD(_vfs_zfs_znode, OID_AUTO, count,
+	CTLFLAG_RD, &zfs_znode_count, 0,
+	"number of zfs vnodes");
+SYSCTL_UQUAD(_vfs_zfs_znode, OID_AUTO, inuse,
+	CTLFLAG_RD, &zfs_znode_inuse_count, 0,
+	"number of zfs vnodes in use");
+SYSCTL_PROC(_vfs_zfs_znode, OID_AUTO, prunable,
+	CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	NULL, 0, param_get_znode_prunable_count, "Q",
+	"number of ARC-prunable zfs vnodes");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_requested,
+	CTLFLAG_RD, &zfs_znode_pruning_requested,
+	"number of ARC pruning requests");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_skipped,
+	CTLFLAG_RD, &zfs_znode_pruning_skipped,
+	"number of ARC pruning skips");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_withwaiter,
+	CTLFLAG_RD, &zfs_znode_pruning_withwaiter,
+	"number of ARC pruning executed due to waiters");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_withwaiter_throttled,
+	CTLFLAG_RD, &zfs_znode_pruning_withwaiter_throttled,
+	"number of ARC pruning with waiters, throttled");
 /* END CSTYLED */
