@@ -118,6 +118,7 @@ SYSCTL_NODE(_vfs_zfs, OID_AUTO, vnops, CTLFLAG_RW, 0, "ZFS VNOPS");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zevent, CTLFLAG_RW, 0, "ZFS event");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zil, CTLFLAG_RW, 0, "ZFS ZIL");
 SYSCTL_NODE(_vfs_zfs, OID_AUTO, zio, CTLFLAG_RW, 0, "ZFS ZIO");
+SYSCTL_NODE(_vfs_zfs, OID_AUTO, znode, CTLFLAG_RW, 0, "ZFS znode");
 
 SYSCTL_NODE(_vfs_zfs_livelist, OID_AUTO, condense, CTLFLAG_RW, 0,
     "ZFS livelist condense");
@@ -741,3 +742,37 @@ param_set_multihost_interval(SYSCTL_HANDLER_ARGS)
 
 	return (0);
 }
+
+/* zfs_vfsops.c */
+
+static int
+param_get_znode_prunable_count(SYSCTL_HANDLER_ARGS)
+{
+	int64_t val;
+	uint64_t count, inuse;
+
+	count = atomic_load_acq_64(&zfs_znode_count);
+	inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	val = count - inuse;
+	return (sysctl_handle_64(oidp, &val, 0, req));
+}
+
+/* BEGIN CSTYLED */
+SYSCTL_UQUAD(_vfs_zfs_znode, OID_AUTO, count,
+	CTLFLAG_RD, &zfs_znode_count, 0,
+	"number of zfs vnodes");
+SYSCTL_UQUAD(_vfs_zfs_znode, OID_AUTO, inuse,
+	CTLFLAG_RD, &zfs_znode_inuse_count, 0,
+	"number of zfs vnodes in use");
+SYSCTL_PROC(_vfs_zfs_znode, OID_AUTO, prunable,
+	CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	NULL, 0, param_get_znode_prunable_count, "Q",
+	"number of ARC-prunable zfs vnodes");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_requested,
+	CTLFLAG_RD, &zfs_znode_pruning_requested,
+	"number of ARC pruning requests");
+SYSCTL_COUNTER_U64(_vfs_zfs_znode, OID_AUTO, pruning_skipped,
+	CTLFLAG_RD, &zfs_znode_pruning_skipped,
+	"number of ARC pruning skips");
+/* END CSTYLED */

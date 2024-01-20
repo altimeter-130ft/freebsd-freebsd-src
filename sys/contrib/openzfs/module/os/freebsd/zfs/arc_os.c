@@ -50,6 +50,7 @@
 #include <machine/vmparam.h>
 #include <sys/vm.h>
 #include <sys/vmmeter.h>
+#include <sys/zfs_vfsops_os.h>
 
 #if __FreeBSD_version >= 1300139
 static struct sx arc_vnlru_lock;
@@ -161,21 +162,49 @@ static int arc_prune_running;
 static void
 arc_prune_task(void *arg)
 {
-	int64_t nr_scan = (intptr_t)arg;
+	int64_t zn_prunable, dn_total, zn_to_scan, dn_to_scan;
+	uint64_t zn_total, zn_inuse;
 
-	arc_reduce_target_size(ptob(nr_scan));
+	dn_to_scan = (intptr_t)arg;
+
+	wmsum_add(&zfs_znode_pruning_requested, 1);
+
+	zn_total = atomic_load_acq_64(&zfs_znode_count);
+	zn_inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	zn_prunable = zn_total - zn_inuse;
+
+	/*
+	 * Scale the number of the prunable dnodes into the znodes by the total
+	 * number of the znodes and dnodes.  A znode may span across multiple
+	 * dnodes, but the precise span estimation is both complicated and opaque
+	 * to the znode and vnode sides.
+	 *
+	 * Assume that the numbers of the znodes and dnodes fit within the 32 bit
+	 * integer type.
+	 */
+	zn_to_scan = dn_to_scan * zn_total;
+	dn_total = aggsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
+	zn_to_scan /= dn_total;
+
+	if (zn_prunable < zn_to_scan) {
+		wmsum_add(&zfs_znode_pruning_skipped, 1);
+		return;
+	}
+
+	arc_reduce_target_size(ptob(zn_to_scan));
 
 #ifndef __ILP32__
-	if (nr_scan > INT_MAX)
-		nr_scan = INT_MAX;
+	if (zn_to_scan > INT_MAX)
+		zn_to_scan = INT_MAX;
 #endif
 
 #if __FreeBSD_version >= 1300139
 	sx_xlock(&arc_vnlru_lock);
-	vnlru_free_vfsops(nr_scan, &zfs_vfsops, arc_vnlru_marker);
+	vnlru_free_vfsops(zn_to_scan, &zfs_vfsops, arc_vnlru_marker);
 	sx_xunlock(&arc_vnlru_lock);
 #else
-	vnlru_free(nr_scan, &zfs_vfsops);
+	vnlru_free(zn_to_scan, &zfs_vfsops);
 #endif
 	atomic_store_rel_int(&arc_prune_running, 0);
 }

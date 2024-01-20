@@ -85,6 +85,7 @@
 #include <vm/vm_param.h>
 #include <sys/zil.h>
 #include <sys/zfs_vnops.h>
+#include <sys/zfs_vfsops.h>
 
 #include <vm/vm_object.h>
 
@@ -5213,6 +5214,7 @@ zfs_freebsd_reclaim(struct vop_reclaim_args *ap)
 	ZFS_TEARDOWN_INACTIVE_EXIT_READ(zfsvfs);
 
 	vp->v_data = NULL;
+	atomic_subtract_rel_64(&zfs_znode_count, 1);
 	return (0);
 }
 
