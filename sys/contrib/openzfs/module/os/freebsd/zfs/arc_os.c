@@ -50,6 +50,8 @@
 #include <machine/vmparam.h>
 #include <sys/vm.h>
 #include <sys/vmmeter.h>
+#include <sys/zfs_vfsops_os.h>
+#include <vm/vm_pageout.h>
 
 #if __FreeBSD_version >= 1300139
 static struct sx arc_vnlru_lock;
@@ -161,22 +163,109 @@ static int arc_prune_running;
 static void
 arc_prune_task(void *arg)
 {
-	int64_t nr_scan = (intptr_t)arg;
+	boolean_t update_ts_last_withwaiter;
+	int64_t zn_prunable, dn_total, zn_to_scan, dn_to_scan, zn_delta;
+	uint64_t zn_total, zn_inuse;
+	struct timespec ts_now, ts_delta;
+	static struct timespec ts_last_withwaiter;
+	static const struct timespec ts_pause_withwaiter =
+	    {.tv_sec = 1, .tv_nsec = 0};
 
-	arc_reduce_target_size(ptob(nr_scan));
+	dn_to_scan = (intptr_t)arg;
+
+	wmsum_add(&zfs_znode_pruning_requested, 1);
+
+	zn_total = atomic_load_acq_64(&zfs_znode_count);
+	zn_inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	/*
+	 * Work around the in-use counter error that may happen under a heavy load.
+	 *
+	 * Fix the in-use counter value only when the counters are stable, ie their
+	 * values do not change across multiple reads.  Otherwise, defer the fix to
+	 * the next chance.
+	 */
+	if (__predict_false(zn_total < zn_inuse))
+		zn_delta = zn_inuse - zn_total;
+	else if (__predict_false(((int64_t)zn_inuse) < 0))
+		zn_delta = (int64_t)zn_inuse;
+	else
+		zn_delta = 0;
+
+	if (__predict_false(0 != zn_delta)) {
+		if (zn_total == atomic_load_64(&zfs_znode_count)) {
+			if (atomic_cmpset_64(&zfs_znode_inuse_count,
+			    zn_inuse,
+			    zn_inuse - zn_delta)) {
+				if (__predict_false(
+				    zn_total != atomic_load_64(&zfs_znode_count))) {
+					atomic_add_64(&zfs_znode_inuse_count, zn_delta);
+				}
+			}
+		}
+	}
+
+	zn_prunable = zn_total - zn_inuse - zn_delta;
+
+	/*
+	 * Scale the number of the prunable dnodes into the znodes by the total
+	 * number of the znodes and dnodes.  A znode may span across multiple
+	 * dnodes, but the precise span estimation is both complicated and opaque
+	 * to the znode and vnode sides.
+	 *
+	 * Assume that the numbers of the znodes and dnodes fit within the 32 bit
+	 * integer type.
+	 */
+	zn_to_scan = dn_to_scan * zn_total;
+	dn_total = aggsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
+	zn_to_scan /= dn_total;
+
+	update_ts_last_withwaiter = B_FALSE;
+
+	if (arc_is_waiting_evict()) {
+		/*
+		 * Someone wants the ARC eviction.  Prune everything unless there are
+		 * no prunable vnodes at all.
+		 *
+		 * Limit the rate up to 1 [Hz] because this eviction makes the vnode
+		 * allocation so expensive.
+		 */
+		wmsum_add(&zfs_znode_pruning_withwaiter, 1);
+		getnanotime(&ts_now);
+		timespecsub(&ts_now, &ts_last_withwaiter, &ts_delta);
+		if (timespeccmp(&ts_delta, &ts_pause_withwaiter, >=)) {
+			if (zn_prunable < zn_to_scan)
+				zn_to_scan = zn_prunable;
+			update_ts_last_withwaiter = B_TRUE;
+		} else
+			wmsum_add(&zfs_znode_pruning_withwaiter_throttled, 1);
+	}
+	if ((zn_prunable < zn_to_scan) || (0 == zn_to_scan)) {
+		wmsum_add(&zfs_znode_pruning_skipped, 1);
+		goto done;
+	}
+
+	arc_reduce_target_size(ptob(zn_to_scan));
 
 #ifndef __ILP32__
-	if (nr_scan > INT_MAX)
-		nr_scan = INT_MAX;
+	if (zn_to_scan > INT_MAX)
+		zn_to_scan = INT_MAX;
 #endif
 
+	if (zn_to_scan > 0) {
 #if __FreeBSD_version >= 1300139
-	sx_xlock(&arc_vnlru_lock);
-	vnlru_free_vfsops(nr_scan, &zfs_vfsops, arc_vnlru_marker);
-	sx_xunlock(&arc_vnlru_lock);
+		sx_xlock(&arc_vnlru_lock);
+		vnlru_free_vfsops(zn_to_scan, &zfs_vfsops, arc_vnlru_marker);
+		sx_xunlock(&arc_vnlru_lock);
 #else
-	vnlru_free(nr_scan, &zfs_vfsops);
+		vnlru_free(zn_to_scan, &zfs_vfsops);
 #endif
+	}
+
+	if (update_ts_last_withwaiter)
+		getnanotime(&ts_last_withwaiter);
+
+done:
 	atomic_store_rel_int(&arc_prune_running, 0);
 }
 
@@ -230,18 +319,45 @@ arc_free_memory(void)
 
 static eventhandler_tag arc_event_lowmem = NULL;
 
+/*
+ * The vm_lowmem event counters.
+ */
+wmsum_t zfs_arc_vm_lowmem_events;
+wmsum_t zfs_arc_vm_lowmem_kmem;
+wmsum_t zfs_arc_vm_lowmem_pages;
+wmsum_t zfs_arc_vm_lowmem_nofree;
+wmsum_t zfs_arc_vm_lowmem_pagedaemon;
+
 static void
-arc_lowmem(void *arg __unused, int howto __unused)
+arc_lowmem(void *arg __unused, int howto)
 {
 	int64_t free_memory, to_free;
+
+	wmsum_add(&zfs_arc_vm_lowmem_events, 1);
+	switch (howto) {
+	case VM_LOW_KMEM:
+		wmsum_add(&zfs_arc_vm_lowmem_kmem, 1);
+		break;
+
+	case VM_LOW_PAGES:
+		wmsum_add(&zfs_arc_vm_lowmem_pages, 1);
+		break;
+
+	default:
+		break;
+	}
+	if (curproc == pageproc)
+		wmsum_add(&zfs_arc_vm_lowmem_pagedaemon, 1);
 
 	arc_no_grow = B_TRUE;
 	arc_warm = B_TRUE;
 	arc_growtime = gethrtime() + SEC2NSEC(arc_grow_retry);
 	free_memory = arc_available_memory();
 	int64_t can_free = arc_c - arc_c_min;
-	if (can_free <= 0)
+	if (can_free <= 0) {
+		wmsum_add(&zfs_arc_vm_lowmem_nofree, 1);
 		return;
+	}
 	to_free = (can_free >> arc_shrink_shift) - MIN(free_memory, 0);
 	DTRACE_PROBE2(arc__needfree, int64_t, free_memory, int64_t, to_free);
 	arc_reduce_target_size(to_free);
@@ -258,6 +374,11 @@ arc_lowmem(void *arg __unused, int howto __unused)
 void
 arc_lowmem_init(void)
 {
+	wmsum_init(&zfs_arc_vm_lowmem_events, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_kmem, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_pages, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_nofree, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_pagedaemon, 0);
 	arc_event_lowmem = EVENTHANDLER_REGISTER(vm_lowmem, arc_lowmem, NULL,
 	    EVENTHANDLER_PRI_FIRST);
 #if __FreeBSD_version >= 1300139
@@ -277,6 +398,11 @@ arc_lowmem_fini(void)
 		sx_destroy(&arc_vnlru_lock);
 	}
 #endif
+	wmsum_fini(&zfs_arc_vm_lowmem_events);
+	wmsum_fini(&zfs_arc_vm_lowmem_kmem);
+	wmsum_fini(&zfs_arc_vm_lowmem_pages);
+	wmsum_fini(&zfs_arc_vm_lowmem_nofree);
+	wmsum_fini(&zfs_arc_vm_lowmem_pagedaemon);
 }
 
 void

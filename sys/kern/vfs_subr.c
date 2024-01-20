@@ -127,6 +127,11 @@ static int	v_inval_buf_range_locked(struct vnode *vp, struct bufobj *bo,
 		    daddr_t startlbn, daddr_t endlbn);
 static void	vnlru_recalc(void);
 
+static SYSCTL_NODE(_vfs, OID_AUTO, vnode, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "vnode configuration and statistics");
+static SYSCTL_NODE(_vfs_vnode, OID_AUTO, vnlru, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "vnode recycling");
+
 /*
  * Number of vnodes in existence.  Increased whenever getnewvnode()
  * allocates a new vnode, decreased in vdropl() for VIRF_DOOMED vnode.
@@ -1260,9 +1265,75 @@ next_iter:
 }
 
 static int max_vnlru_free = 10000; /* limit on vnode free requests per call */
+static bool recycle_vnode_bufs_pages = true;
+static bool recycle_vnode_nc_src = true;
 SYSCTL_INT(_debug, OID_AUTO, max_vnlru_free, CTLFLAG_RW, &max_vnlru_free,
     0,
+    "limit on vnode free requests per call to the vnlru_free routine (legacy)");
+SYSCTL_INT(_vfs_vnode_vnlru, OID_AUTO, max_free_per_call, CTLFLAG_RW,
+    &max_vnlru_free, 0,
     "limit on vnode free requests per call to the vnlru_free routine");
+SYSCTL_BOOL(_vfs_vnode_vnlru, OID_AUTO, recycle_bufs_pages, CTLFLAG_RW,
+    &recycle_vnode_bufs_pages, 0,
+    "enable recycling vnodes with clean buffers and clean/dirty VM pages");
+SYSCTL_BOOL(_vfs_vnode_vnlru, OID_AUTO, recycle_nc_src, CTLFLAG_RW,
+    &recycle_vnode_nc_src, 0,
+    "enable recycling vnodes acting as namecache source");
+
+/*
+ * Count the hold sources on a regular file vnode.
+ */
+static void
+vnlru_count_hold_sources_reg(struct vnode * restrict vp,
+    int * restrict vn_holdcnt,
+    int * restrict cleanbuf_holdcnt,
+    int * restrict dirtybuf_holdcnt,
+    int * restrict vmpage_holdcnt,
+    int * restrict unknown_holdcnt)
+{
+	struct vm_object *object;
+	struct bufobj *bo;
+
+	VNPASS(VREG == vp->v_type, vp);
+
+	*vn_holdcnt = atomic_load_int(&vp->v_holdcnt);
+
+	bo = &vp->v_bufobj;
+	*cleanbuf_holdcnt = atomic_load_int(&bo->bo_clean.bv_cnt);
+	*dirtybuf_holdcnt = atomic_load_int(&bo->bo_dirty.bv_cnt);
+
+	object = atomic_load_ptr(&vp->v_object);
+	if (object != NULL &&
+	    object->type == OBJT_VNODE &&
+	    object->resident_page_count > 0)
+		*vmpage_holdcnt = 1;
+	else
+		*vmpage_holdcnt = 0;
+
+	*unknown_holdcnt = *vn_holdcnt -
+	    (*cleanbuf_holdcnt + *dirtybuf_holdcnt + *vmpage_holdcnt);
+}
+
+/*
+ * Count the hold sources on a directory vnode.
+ */
+static void
+vnlru_count_hold_sources_dir(struct vnode * restrict vp,
+    int * restrict vn_holdcnt,
+    int * restrict nc_src_holdcnt,
+    int * restrict unknown_holdcnt)
+{
+	VNPASS(VDIR == vp->v_type, vp);
+
+	*vn_holdcnt = atomic_load_int(&vp->v_holdcnt);
+
+	if (LIST_EMPTY(&vp->v_cache_src))
+		*nc_src_holdcnt = 0;
+	else
+		*nc_src_holdcnt = 1;
+
+	*unknown_holdcnt = *vn_holdcnt - *nc_src_holdcnt;
+}
 
 /*
  * Attempt to reduce the free list by the requested amount.
@@ -1272,7 +1343,9 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp)
 {
 	struct vnode *vp;
 	struct mount *mp;
-	int ocount;
+	int ocount, vn_holdcnt, cleanbuf_holdcnt, dirtybuf_holdcnt, vmpage_holdcnt,
+	    nc_src_holdcnt, unknown_holdcnt;
+	bool *phase2_go_toggle, phase2_go;
 
 	mtx_assert(&vnode_list_mtx, MA_OWNED);
 	if (count > max_vnlru_free)
@@ -1291,8 +1364,6 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp)
 		}
 		if (__predict_false(vp->v_type == VMARKER))
 			continue;
-		if (vp->v_holdcnt > 0)
-			continue;
 		/*
 		 * Don't recycle if our vnode is from different type
 		 * of mount point.  Note that mp is type-safe, the
@@ -1303,8 +1374,70 @@ vnlru_free_impl(int count, struct vfsops *mnt_op, struct vnode *mvp)
 		    mp->mnt_op != mnt_op) {
 			continue;
 		}
-		if (__predict_false(vp->v_type == VBAD || vp->v_type == VNON)) {
+		if (vp->v_type == VBAD || __predict_false(vp->v_type == VNON)) {
 			continue;
+		}
+		vn_holdcnt = atomic_load_int(&vp->v_holdcnt);
+		if (vn_holdcnt > 0) {
+			phase2_go_toggle = NULL;
+			phase2_go = false;
+
+			switch (vp->v_type) {
+				case VREG:
+					phase2_go_toggle = &recycle_vnode_bufs_pages;
+
+					/*
+					 * Count the holds by the bufs and VM pages in the object,
+					 * and compare them to the actual hold count.
+					 */
+					vnlru_count_hold_sources_reg(vp,
+					    &vn_holdcnt,
+					    &cleanbuf_holdcnt,
+					    &dirtybuf_holdcnt,
+					    &vmpage_holdcnt,
+					    &unknown_holdcnt);
+
+					if ((cleanbuf_holdcnt == vn_holdcnt) &&
+					    (0 == dirtybuf_holdcnt) && (0 == vmpage_holdcnt)) {
+						phase2_go = true;
+					} else if (
+					    ((cleanbuf_holdcnt + vmpage_holdcnt) == vn_holdcnt) &&
+					    (0 == dirtybuf_holdcnt)) {
+						phase2_go = true;
+					}
+					break;
+
+				case VDIR:
+					phase2_go_toggle = &recycle_vnode_nc_src;
+
+					/*
+					 * Count the holds by the namecache entries from this
+					 * vnode, and compare them to the actual hold count.
+					 */
+
+					vnlru_count_hold_sources_dir(vp,
+					    &vn_holdcnt,
+					    &nc_src_holdcnt,
+					    &unknown_holdcnt);
+
+					if (nc_src_holdcnt == vn_holdcnt) {
+						phase2_go = true;
+					}
+
+					break;
+
+				default:
+					/*
+					 * NOP; the rest of the vnode types should not happen so
+					 * often.
+					 */
+					break;
+			}
+
+			if ((NULL == phase2_go_toggle) ||
+			    !(*phase2_go_toggle) ||
+			    !phase2_go)
+				continue;
 		}
 		if (!vhold_recycle_free(vp))
 			continue;
@@ -3506,7 +3639,9 @@ vhold_smr(struct vnode *vp)
 static bool
 vhold_recycle_free(struct vnode *vp)
 {
-	int count;
+	int count, vn_holdcnt, cleanbuf_holdcnt, dirtybuf_holdcnt, vmpage_holdcnt,
+	    nc_src_holdcnt, unknown_holdcnt;
+	bool *phase2_go_toggle, phase2_go;
 
 	mtx_assert(&vnode_list_mtx, MA_OWNED);
 
@@ -3519,10 +3654,61 @@ vhold_recycle_free(struct vnode *vp)
 		}
 		VNASSERT(count >= 0, vp, ("invalid hold count %d\n", count));
 		if (count > 0) {
-			return (false);
+			/*
+			 * Check for the vnode holds again.  Refer to the phase 2 test in
+			 * vnlru_free_impl() for the detail.
+			 */
+			phase2_go_toggle = NULL;
+			phase2_go = false;
+
+			switch (vp->v_type) {
+			case VREG:
+				phase2_go_toggle = &recycle_vnode_bufs_pages;
+
+				vnlru_count_hold_sources_reg(vp,
+				    &vn_holdcnt,
+				    &cleanbuf_holdcnt,
+				    &dirtybuf_holdcnt,
+				    &vmpage_holdcnt,
+				    &unknown_holdcnt);
+
+				if ((cleanbuf_holdcnt == vn_holdcnt) &&
+				    (0 == vmpage_holdcnt) && (0 == dirtybuf_holdcnt)) {
+					phase2_go = true;
+				} else if (
+				    ((cleanbuf_holdcnt + vmpage_holdcnt) == vn_holdcnt) &&
+				    (0 == dirtybuf_holdcnt)) {
+					phase2_go = true;
+				}
+
+				break;
+
+			case VDIR:
+				phase2_go_toggle = &recycle_vnode_nc_src;
+
+				vnlru_count_hold_sources_dir(vp,
+				    &vn_holdcnt,
+				    &nc_src_holdcnt,
+				    &unknown_holdcnt);
+
+				if (nc_src_holdcnt == vn_holdcnt) {
+					phase2_go = true;
+				}
+
+				break;
+
+			default:
+				return (false);
+			}
+
+			if ((NULL == phase2_go_toggle) ||
+			    !(*phase2_go_toggle) ||
+			    !phase2_go)
+				return (false);
 		}
 		if (atomic_fcmpset_int(&vp->v_holdcnt, &count, count + 1)) {
-			vfs_freevnodes_dec();
+			if (0 == count)
+				vfs_freevnodes_dec();
 			return (true);
 		}
 	}

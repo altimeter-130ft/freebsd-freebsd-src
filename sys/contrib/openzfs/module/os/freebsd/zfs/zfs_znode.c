@@ -49,6 +49,7 @@
 #include <sys/zfs_ioctl.h>
 #include <sys/zfs_rlock.h>
 #include <sys/zfs_fuid.h>
+#include <sys/zfs_vfsops.h>
 #include <sys/dnode.h>
 #include <sys/fs/zfs.h>
 #endif /* _KERNEL */
@@ -543,6 +544,12 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	if (vp->v_type != VFIFO)
 		VN_LOCK_ASHARE(vp);
 
+	atomic_add_rel_64(&zfs_znode_count, 1);
+	/*
+	 * Defer the increment of zfs_znode_inuse_count until vp gets inserted into
+	 * mp.
+	 */
+
 	return (zp);
 }
 
@@ -823,6 +830,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 		vp->v_vflag &= ~VV_FORCEINSMQ;
 		(void) err;
 		KASSERT(err == 0, ("insmntque() failed: error %d", err));
+		atomic_add_rel_64(&zfs_znode_inuse_count, 1);
 	}
 	kmem_free(sa_attrs, sizeof (sa_bulk_attr_t) * ZPL_END);
 	ZFS_OBJ_HOLD_EXIT(zfsvfs, obj);
@@ -1052,6 +1060,7 @@ again:
 		if (err == 0) {
 			vp->v_hash = obj_num;
 			VOP_UNLOCK1(vp);
+			atomic_add_rel_64(&zfs_znode_inuse_count, 1);
 		} else {
 			zp->z_vnode = NULL;
 			zfs_znode_dmu_fini(zp);
