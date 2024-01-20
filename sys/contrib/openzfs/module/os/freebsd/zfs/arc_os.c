@@ -50,6 +50,8 @@
 #include <machine/vmparam.h>
 #include <sys/vm.h>
 #include <sys/vmmeter.h>
+#include <sys/zfs_vfsops_os.h>
+#include <vm/vm_pageout.h>
 
 extern struct vfsops zfs_vfsops;
 
@@ -166,18 +168,45 @@ arc_free_memory(void)
 
 static eventhandler_tag arc_event_lowmem = NULL;
 
+/*
+ * The vm_lowmem event counters.
+ */
+wmsum_t zfs_arc_vm_lowmem_events;
+wmsum_t zfs_arc_vm_lowmem_kmem;
+wmsum_t zfs_arc_vm_lowmem_pages;
+wmsum_t zfs_arc_vm_lowmem_nofree;
+wmsum_t zfs_arc_vm_lowmem_pagedaemon;
+
 static void
-arc_lowmem(void *arg __unused, int howto __unused)
+arc_lowmem(void *arg __unused, int howto)
 {
 	int64_t free_memory, to_free;
+
+	wmsum_add(&zfs_arc_vm_lowmem_events, 1);
+	switch (howto) {
+	case VM_LOW_KMEM:
+		wmsum_add(&zfs_arc_vm_lowmem_kmem, 1);
+		break;
+
+	case VM_LOW_PAGES:
+		wmsum_add(&zfs_arc_vm_lowmem_pages, 1);
+		break;
+
+	default:
+		break;
+	}
+	if (curproc == pageproc)
+		wmsum_add(&zfs_arc_vm_lowmem_pagedaemon, 1);
 
 	arc_no_grow = B_TRUE;
 	arc_warm = B_TRUE;
 	arc_growtime = gethrtime() + SEC2NSEC(arc_grow_retry);
 	free_memory = arc_available_memory();
 	int64_t can_free = arc_c - arc_c_min;
-	if (can_free <= 0)
+	if (can_free <= 0) {
+		wmsum_add(&zfs_arc_vm_lowmem_nofree, 1);
 		return;
+	}
 	to_free = (can_free >> arc_shrink_shift) - MIN(free_memory, 0);
 	DTRACE_PROBE2(arc__needfree, int64_t, free_memory, int64_t, to_free);
 	arc_reduce_target_size(to_free);
@@ -194,6 +223,11 @@ arc_lowmem(void *arg __unused, int howto __unused)
 void
 arc_lowmem_init(void)
 {
+	wmsum_init(&zfs_arc_vm_lowmem_events, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_kmem, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_pages, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_nofree, 0);
+	wmsum_init(&zfs_arc_vm_lowmem_pagedaemon, 0);
 	arc_event_lowmem = EVENTHANDLER_REGISTER(vm_lowmem, arc_lowmem, NULL,
 	    EVENTHANDLER_PRI_FIRST);
 }
@@ -203,6 +237,11 @@ arc_lowmem_fini(void)
 {
 	if (arc_event_lowmem != NULL)
 		EVENTHANDLER_DEREGISTER(vm_lowmem, arc_event_lowmem);
+	wmsum_fini(&zfs_arc_vm_lowmem_events);
+	wmsum_fini(&zfs_arc_vm_lowmem_kmem);
+	wmsum_fini(&zfs_arc_vm_lowmem_pages);
+	wmsum_fini(&zfs_arc_vm_lowmem_nofree);
+	wmsum_fini(&zfs_arc_vm_lowmem_pagedaemon);
 }
 
 void

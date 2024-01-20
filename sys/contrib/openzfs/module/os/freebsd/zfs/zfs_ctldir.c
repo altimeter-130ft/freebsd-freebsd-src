@@ -186,6 +186,11 @@ sfs_vgetx(struct mount *mp, int flags, uint64_t parent_id, uint64_t id,
 	}
 
 	/*
+	 * Do not account the vnodes for the ZFS sfs; such the vnodes are not
+	 * subject to the ARC pruning.
+	 */
+
+	/*
 	 * Exclusively lock the vnode vnode while it's being constructed.
 	 */
 	lockmgr(vp->v_vnlock, LK_EXCLUSIVE, NULL);

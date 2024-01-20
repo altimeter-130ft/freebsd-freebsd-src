@@ -8205,6 +8205,18 @@ arc_fini(void)
 	ASSERT0(arc_loaned_bytes);
 }
 
+boolean_t
+arc_is_waiting_evict(void)
+{
+	boolean_t is_empty;
+
+	mutex_enter(&arc_evict_lock);
+	is_empty = list_is_empty(&arc_evict_waiters);
+	mutex_exit(&arc_evict_lock);
+
+	return (!is_empty);
+}
+
 /*
  * Level 2 ARC
  *
