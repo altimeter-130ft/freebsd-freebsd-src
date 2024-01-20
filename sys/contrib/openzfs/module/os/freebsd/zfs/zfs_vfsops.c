@@ -40,6 +40,7 @@
 #include <sys/vfs.h>
 #include <sys/mntent.h>
 #include <sys/mount.h>
+#include <sys/arc_impl.h>
 #include <sys/cmn_err.h>
 #include <sys/zfs_znode.h>
 #include <sys/zfs_vnops.h>
@@ -164,6 +165,36 @@ VFS_SET(zfs_vfsops, zfs, VFCF_JAIL | VFCF_DELEGADMIN);
  * from being unloaded after a umount -f
  */
 static uint32_t	zfs_active_fs_count = 0;
+
+/*
+ * The counts of the znodes and those in use. (vp->v_usecount > 0)
+ * They are used to estimate the number of the ARC-prunable [vz]nodes and
+ * dnodes.
+ */
+uint64_t zfs_znode_count;
+uint64_t zfs_znode_inuse_count;
+
+/*
+ * The stats of the ARC pruning.
+ *
+ * - zfs_znode_pruning_requested
+ *   The requests of the ARC pruning.
+ *
+ * - zfs_znode_pruning_skipped
+ *   The skipped ARC pruning attempts because the prunable znodes do not meet
+ *   the requested size.
+ *
+ * - zfs_znode_pruning_withwaiter
+ *   The ARC pruning attempts executed because there is at least one thread
+ *   waiting for the ARC eviction.
+ *
+ * - zfs_znode_pruning_withwaiter_throttled
+ *   The ARC pruning attempts not boosted due to the rate limit.
+ */
+wmsum_t zfs_znode_pruning_requested;
+wmsum_t zfs_znode_pruning_skipped;
+wmsum_t zfs_znode_pruning_withwaiter;
+wmsum_t zfs_znode_pruning_withwaiter_throttled;
 
 int
 zfs_get_temporary_prop(dsl_dataset_t *ds, zfs_prop_t zfs_prop, uint64_t *val,
@@ -1230,6 +1261,9 @@ zfs_domount(vfs_t *vfsp, char *osname)
 #if defined(_KERNEL) && !defined(KMEM_DEBUG)
 	vfsp->mnt_kern_flag |= MNTK_FPLOOKUP;
 #endif
+
+	vfsp->mnt_fsvninusep = &zfs_znode_inuse_count;
+
 	/*
 	 * The fsid is 64 bits, composed of an 8-bit fs type, which
 	 * separates our fsid from any other filesystem types, and a
@@ -2104,17 +2138,102 @@ static struct vnode *zfs_vnlru_marker;
 static arc_prune_t *zfs_prune;
 
 static void
-zfs_prune_task(uint64_t nr_to_scan, void *arg __unused)
+zfs_prune_task(uint64_t dn_to_scan, void *arg __unused)
 {
-	if (nr_to_scan > INT_MAX)
-		nr_to_scan = INT_MAX;
+	boolean_t update_ts_last_withwaiter;
+	int64_t zn_prunable, dn_total, zn_delta;
+	uint64_t zn_total, zn_inuse, zn_to_scan;
+	struct timespec ts_now, ts_delta;
+	static struct timespec ts_last_withwaiter;
+	static const struct timespec ts_pause_withwaiter =
+	    {.tv_sec = 1, .tv_nsec = 0};
+
+	wmsum_add(&zfs_znode_pruning_requested, 1);
+
+	zn_total = atomic_load_acq_64(&zfs_znode_count);
+	zn_inuse = atomic_load_acq_64(&zfs_znode_inuse_count);
+
+	/*
+	 * Work around the in-use counter error that may happen under a heavy load.
+	 *
+	 * Fix the in-use counter value only when the counters are stable, ie their
+	 * values do not change across multiple reads.  Otherwise, defer the fix to
+	 * the next chance.
+	 */
+	if (__predict_false(zn_total < zn_inuse))
+		zn_delta = zn_inuse - zn_total;
+	else if (__predict_false(((int64_t)zn_inuse) < 0))
+		zn_delta = (int64_t)zn_inuse;
+	else
+		zn_delta = 0;
+
+	if (__predict_false(0 != zn_delta)) {
+		if (zn_total == atomic_load_64(&zfs_znode_count)) {
+			if (atomic_cmpset_64(&zfs_znode_inuse_count, zn_inuse,
+			    zn_inuse - zn_delta)) {
+				if (__predict_false(
+				    zn_total != atomic_load_64(&zfs_znode_count))) {
+					atomic_add_64(&zfs_znode_inuse_count, zn_delta);
+				}
+			}
+		}
+	}
+
+	zn_prunable = zn_total - zn_inuse - zn_delta;
+
+	/*
+	 * Scale the number of the prunable dnodes into the znodes by the total
+	 * number of the znodes and dnodes.  A znode may span across multiple
+	 * dnodes, but the precise span estimation is both complicated and opaque
+	 * to the znode and vnode sides.
+	 *
+	 * Assume that the numbers of the znodes and dnodes fit within the 32 bit
+	 * integer type.
+	 */
+	zn_to_scan = dn_to_scan * zn_total;
+	dn_total = wmsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
+	zn_to_scan /= dn_total;
+
+	update_ts_last_withwaiter = B_FALSE;
+
+	if (arc_is_waiting_evict()) {
+		/*
+		 * Someone wants the ARC eviction.  Prune everything unless there are
+		 * no prunable vnodes at all.
+		 *
+		 * Limit the rate up to 1 [Hz] because this eviction makes the vnode
+		 * allocation so expensive.
+		 */
+		wmsum_add(&zfs_znode_pruning_withwaiter, 1);
+		getnanotime(&ts_now);
+		timespecsub(&ts_now, &ts_last_withwaiter, &ts_delta);
+		if (timespeccmp(&ts_delta, &ts_pause_withwaiter, >=)) {
+			if (zn_prunable < zn_to_scan)
+				zn_to_scan = zn_prunable;
+			update_ts_last_withwaiter = B_TRUE;
+		} else
+			wmsum_add(&zfs_znode_pruning_withwaiter_throttled, 1);
+	}
+	if ((zn_prunable < zn_to_scan) || (0 == zn_to_scan)) {
+		wmsum_add(&zfs_znode_pruning_skipped, 1);
+		return;
+	}
+
+	if (zn_to_scan > INT_MAX)
+		zn_to_scan = INT_MAX;
+
+	if (zn_to_scan > 0) {
 #if __FreeBSD_version >= 1300139
-	sx_xlock(&zfs_vnlru_lock);
-	vnlru_free_vfsops(nr_to_scan, &zfs_vfsops, zfs_vnlru_marker);
-	sx_xunlock(&zfs_vnlru_lock);
+		sx_xlock(&zfs_vnlru_lock);
+		vnlru_free_vfsops(zn_to_scan, &zfs_vfsops, zfs_vnlru_marker);
+		sx_xunlock(&zfs_vnlru_lock);
 #else
-	vnlru_free(nr_to_scan, &zfs_vfsops);
+		vnlru_free(zn_to_scan, &zfs_vfsops);
 #endif
+	}
+
+	if (update_ts_last_withwaiter)
+		getnanotime(&ts_last_withwaiter);
 }
 
 void
@@ -2140,6 +2259,11 @@ zfs_init(void)
 	 */
 	zfs_vnodes_adjust();
 
+	wmsum_init(&zfs_znode_pruning_requested, 0);
+	wmsum_init(&zfs_znode_pruning_skipped, 0);
+	wmsum_init(&zfs_znode_pruning_withwaiter, 0);
+	wmsum_init(&zfs_znode_pruning_withwaiter_throttled, 0);
+
 	dmu_objset_register_type(DMU_OST_ZFS, zpl_get_file_info);
 
 	zfsvfs_taskq = taskq_create("zfsvfs", 1, minclsyspri, 0, 0, 0);
@@ -2159,6 +2283,11 @@ zfs_fini(void)
 	vnlru_free_marker(zfs_vnlru_marker);
 	sx_destroy(&zfs_vnlru_lock);
 #endif
+
+	wmsum_fini(&zfs_znode_pruning_requested);
+	wmsum_fini(&zfs_znode_pruning_skipped);
+	wmsum_fini(&zfs_znode_pruning_withwaiter);
+	wmsum_fini(&zfs_znode_pruning_withwaiter_throttled);
 
 	taskq_destroy(zfsvfs_taskq);
 	zfsctl_fini();
