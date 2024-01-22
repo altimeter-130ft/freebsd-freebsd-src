@@ -151,6 +151,9 @@ arc_default_max(uint64_t min, uint64_t allmem)
 	return (MAX(allmem * 5 / 8, size));
 }
 
+/* The flag indicating a running ARC pruning task. */
+static int arc_prune_running;
+
 /*
  * Helper function for arc_prune_async() it is responsible for safely
  * handling the execution of a registered arc_prune_func_t.
@@ -174,6 +177,7 @@ arc_prune_task(void *arg)
 #else
 	vnlru_free(nr_scan, &zfs_vfsops);
 #endif
+	atomic_store_rel_int(&arc_prune_running, 0);
 }
 
 /*
@@ -190,6 +194,12 @@ arc_prune_task(void *arg)
 void
 arc_prune_async(int64_t adjust)
 {
+	int ret;
+
+	/* Avoid piling up the ARC pruning tasks. */
+	ret = atomic_cmpset_acq_int(&arc_prune_running, 0, 1);
+	if (!ret)
+		return;
 
 #ifndef __LP64__
 	if (adjust > INTPTR_MAX)
