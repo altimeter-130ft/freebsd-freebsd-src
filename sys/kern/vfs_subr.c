@@ -3332,6 +3332,8 @@ void
 vget_finish_ref(struct vnode *vp, enum vgetstate vs)
 {
 	int old;
+	struct mount *mp;
+	uint64_t *fsvninusep;
 
 	VNPASS(vs == VGET_HOLDCNT || vs == VGET_USECOUNT, vp);
 	VNPASS(vp->v_holdcnt > 0, vp);
@@ -3354,6 +3356,13 @@ vget_finish_ref(struct vnode *vp, enum vgetstate vs)
 #else
 		refcount_release(&vp->v_holdcnt);
 #endif
+	} else {
+		mp = vp->v_mount;
+		if (NULL != mp) {
+			fsvninusep = mp->mnt_fsvninusep;
+			if (NULL != fsvninusep)
+				atomic_add_rel_64(fsvninusep, 1);
+		}
 	}
 }
 
@@ -3515,9 +3524,22 @@ vput_final(struct vnode *vp, enum vput_op func)
 {
 	int error;
 	bool want_unlock;
+	struct mount *mp;
+	uint64_t *fsvninusep;
 
 	CTR2(KTR_VFS, "%s: vp %p", __func__, vp);
 	VNPASS(vp->v_holdcnt > 0, vp);
+
+	mp = vp->v_mount;
+	/*
+	 * The filesystem-local in-use vnode count is not incremented if
+	 * insmntque() fails.  vp->v_data is set to NULL in such the case.
+	 */
+	if ((NULL != mp) && (NULL != vp->v_data)) {
+		fsvninusep = mp->mnt_fsvninusep;
+		if (NULL != fsvninusep)
+			atomic_subtract_rel_64(fsvninusep, 1);
+	}
 
 	VI_LOCK(vp);
 
