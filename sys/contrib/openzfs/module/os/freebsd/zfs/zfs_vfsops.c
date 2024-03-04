@@ -2191,7 +2191,7 @@ zfs_prune_task(uint64_t dn_to_scan, void *arg __unused)
 	 * integer type.
 	 */
 	zn_to_scan = dn_to_scan * zn_total;
-	dn_total = wmsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
+	dn_total = aggsum_value(&arc_sums.arcstat_dnode_size) / sizeof(dnode_t);
 	zn_to_scan /= dn_total;
 
 	update_ts_last_withwaiter = B_FALSE;
