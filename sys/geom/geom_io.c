@@ -135,17 +135,17 @@ g_bioq_first(struct g_bioq *bq)
 	return (bp);
 }
 
-struct bio *
-g_new_bio(void)
+static struct bio *
+g_newalloc_bio_flags(int flags)
 {
 	struct bio *bp;
 
-	bp = uma_zalloc(biozone, M_NOWAIT | M_ZERO);
+	bp = uma_zalloc(biozone, M_ZERO | flags);
 #ifdef KTR
 	if ((KTR_COMPILE & KTR_GEOM) && (ktr_mask & KTR_GEOM)) {
 		struct stack st;
 
-		CTR1(KTR_GEOM, "g_new_bio(): %p", bp);
+		CTR1(KTR_GEOM, "g_newalloc_bio_flags(): %p", bp);
 		stack_save(&st);
 		CTRSTACK(KTR_GEOM, &st, 3);
 	}
@@ -153,22 +153,25 @@ g_new_bio(void)
 	return (bp);
 }
 
+static int reserved_new_bios = 65536;
+
 struct bio *
-g_alloc_bio(void)
+g_new_bio(void)
 {
 	struct bio *bp;
 
-	bp = uma_zalloc(biozone, M_WAITOK | M_ZERO);
-#ifdef KTR
-	if ((KTR_COMPILE & KTR_GEOM) && (ktr_mask & KTR_GEOM)) {
-		struct stack st;
+	bp = g_newalloc_bio_flags(M_NOWAIT |
+	    ((reserved_new_bios > 0) ? (M_USE_RESERVE) : (0)));
+	if (__predict_false(NULL == bp))
+		printf("g_new_bio(): failed to allocate\n");
 
-		CTR1(KTR_GEOM, "g_alloc_bio(): %p", bp);
-		stack_save(&st);
-		CTRSTACK(KTR_GEOM, &st, 3);
-	}
-#endif
 	return (bp);
+}
+
+struct bio *
+g_alloc_bio(void)
+{
+	return (g_newalloc_bio_flags(M_WAITOK));
 }
 
 void
@@ -191,7 +194,8 @@ g_clone_bio(struct bio *bp)
 {
 	struct bio *bp2;
 
-	bp2 = uma_zalloc(biozone, M_NOWAIT | M_ZERO);
+	bp2 = uma_zalloc(biozone, M_NOWAIT | M_ZERO |
+	    ((reserved_new_bios > 0) ? (M_USE_RESERVE) : (0)));
 	if (bp2 != NULL) {
 		bp2->bio_parent = bp;
 		bp2->bio_cmd = bp->bio_cmd;
@@ -277,6 +281,14 @@ g_io_init(void)
 	    NULL, NULL,
 	    NULL, NULL,
 	    0, 0);
+	/*
+	 * XXX the reservation of a uma(9) zone cannot be altered if it is serving
+	 * any items.
+	 */
+	if (reserved_new_bios > 0) {
+		uma_prealloc(biozone, reserved_new_bios);
+		uma_zone_reserve(biozone, reserved_new_bios);
+	}
 }
 
 int
@@ -732,6 +744,9 @@ int inflight_transient_maps;
 SYSCTL_INT(_kern_geom, OID_AUTO, inflight_transient_maps, CTLFLAG_RD,
     &inflight_transient_maps, 0,
     "Current count of the active transient maps");
+SYSCTL_INT(_kern_geom, OID_AUTO, reserved_new_bios, CTLFLAG_RDTUN,
+    &reserved_new_bios, 0,
+    "Number of reserved new bios for non-blocking allocation");
 
 static int
 g_io_transient_map_bio(struct bio *bp)
